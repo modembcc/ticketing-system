@@ -39,7 +39,7 @@ describe("health endpoints", () => {
     const { rows } = await pool.query(
       "SELECT version FROM schema_migrations ORDER BY version",
     );
-    expect(rows).toEqual([{ version: "0001_init.sql" }]);
+    expect(rows.map((r: { version: string }) => r.version)).toContain("0001_init.sql");
   });
 
   it("reports unavailable once the database connection is gone", async () => {

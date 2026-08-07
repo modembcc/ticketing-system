@@ -59,8 +59,46 @@ Plain numbered `.sql` files in `/migrations`, applied in order by
 `schema_migrations` table the runner creates on first run. Add a new
 migration by creating the next-numbered file; nothing else to register.
 
+## API
+
+Admin:
+
+- `POST /admin/events` — create an event; generates one seat row per
+  `capacity` slot in the same transaction
+- `GET /admin/events` — list events, each with `availableSeats`
+- `GET /admin/events/:id` — fetch one event
+
+Customer:
+
+- `GET /events` — list events, each with `availableSeats`
+
+`POST /admin/events` body:
+
+```json
+{
+  "name": "Rocket Launch",
+  "venue": "Cape Canaveral",
+  "startsAt": "2026-02-01T00:00:00.000Z",
+  "saleStartsAt": "2026-01-01T00:00:00.000Z",
+  "saleEndsAt": "2026-01-08T00:00:00.000Z",
+  "capacity": 500
+}
+```
+
+## Modules
+
+`modules/catalog` and `modules/inventory` each own a Postgres schema
+(`catalog.*`, `inventory.*`) and expose a public interface via their
+`index.ts`. Code outside a module only imports from that `index.ts` —
+never a module's internal `src/*` files, and never another module's
+tables directly. See `DECISIONS.md` for how event + seat creation stays
+atomic across the two modules without becoming a saga.
+
 ## Status
 
-**M0 — Scaffold: done.** Compose stack, migration runner, health
-endpoints, one Testcontainers integration test. No domain modules yet —
-those start at M1.
+**M0 — Scaffold: done.**
+
+**M1 — Catalog + inventory: done.** Admin CRUD for events, seat rows
+generated on create, customer event listing, sale-window check
+(`isSaleWindowOpen`) built and boundary-tested for M2's reservation
+endpoint to use. Next: M2 — holds and expiry.

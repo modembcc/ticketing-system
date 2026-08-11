@@ -68,3 +68,49 @@ boundaries (exactly-at-start and exactly-at-end are OPEN), matching the
 spec's note that the window gates reservation *creation* only — a
 reservation started right before close is allowed to finish paying after
 the window shuts.
+
+## 2026-08-11 — M2 seat holding: retry loop, not single-shot select+update
+
+The spec's example seat-hold SQL is a single-shot conditional UPDATE: pick
+N candidate seat ids, try to claim exactly those, roll back and 409 if you
+didn't get all N. That's correct when a request already knows *which*
+seats it wants — but customers here only specify a seat *count* (no seat
+maps, anti-goal), so with `seatCount=1` every concurrent request
+independently selects the same lowest-id `AVAILABLE` seat as its only
+candidate. Exactly one wins it; everyone else has no fallback and fails
+immediately, even with other seats still free. A first draft had exactly
+this bug — caught by a Plan-agent review before it was built, not after.
+
+The fix (`modules/inventory/src/seats.repository.ts`,
+`holdSeatsForEvent`): loop candidate-select + conditional-UPDATE inside the
+reservation's own transaction. A losing round re-selects from what's still
+available (excluding whatever just got committed) and tries again, up to a
+generous attempt cap, until it reaches the requested count or genuinely
+runs out. A final shortfall rolls back the whole transaction — including
+any partial holds picked up in earlier rounds of the same attempt — and
+the caller gets a 409. Still never a bare read-then-write outside a
+conditional UPDATE; just the spec's own primitive applied repeatedly
+instead of once. Verified against the M2 acceptance test (50 concurrent
+requests for a 10-seat event → exactly 10 holds, 40 clean 409s) across
+multiple runs, not just once.
+
+## 2026-08-11 — Sweeper: one transaction per batch, not per reservation
+
+`runSweepOnce` expires all due reservations in a single bulk `UPDATE ...
+RETURNING`, then releases each one's seats in the same transaction, rather
+than a separate transaction per reservation. What makes race condition #2
+(sweeper vs. a future payment-confirm handler) safe is the conditional
+`WHERE state='AWAITING_PAYMENT' AND held_until < now()` predicate, not the
+transaction boundary — batching doesn't weaken that guarantee, and at M2
+there's no other writer yet for a per-row failure to be isolated from.
+Simpler now, nothing foreclosed for M3.
+
+## 2026-08-11 — `ordering.reservations` schema: no PENDING state, no payment columns yet
+
+A reservation row is only inserted *after* seats are successfully held,
+directly as `AWAITING_PAYMENT` — no persisted `PENDING` state, since
+there's nothing to compensate if the hold attempt fails before any row
+exists. Columns like `amount_cents`, `payment_id`, `idempotency_key`, and
+states like `PAID`/`FULFILLED` are left out of the M2 migration and will
+arrive via `ALTER TABLE` in M3/M4 when the payment saga actually needs
+them — same "don't build schema ahead of its milestone" call made for M1.

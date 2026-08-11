@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { Pool } from "pg";
 import { registerAdminEventRoutes } from "./routes/admin-events.js";
 import { registerCustomerEventRoutes } from "./routes/events.js";
+import { registerReservationRoutes } from "./routes/reservations.js";
 
 export interface BuildAppOptions {
   pool: Pool;
@@ -29,6 +30,7 @@ export function buildApp({ pool }: BuildAppOptions): FastifyInstance {
 
   registerAdminEventRoutes(app, pool);
   registerCustomerEventRoutes(app, pool);
+  registerReservationRoutes(app, pool);
 
   return app;
 }

@@ -71,6 +71,11 @@ Admin:
 Customer:
 
 - `GET /events` — list events, each with `availableSeats`
+- `POST /reservations` — hold N seats for 5 minutes (requires
+  `X-Customer-Id` header). Body: `{ "eventId": "...", "seatCount": 2 }`.
+  Seats are auto-assigned, not chosen by the customer. `404` unknown
+  event, `422` sale window not open, `409` not enough seats available,
+  `400` bad input.
 
 `POST /admin/events` body:
 
@@ -87,12 +92,21 @@ Customer:
 
 ## Modules
 
-`modules/catalog` and `modules/inventory` each own a Postgres schema
-(`catalog.*`, `inventory.*`) and expose a public interface via their
-`index.ts`. Code outside a module only imports from that `index.ts` —
-never a module's internal `src/*` files, and never another module's
-tables directly. See `DECISIONS.md` for how event + seat creation stays
-atomic across the two modules without becoming a saga.
+`modules/catalog`, `modules/inventory`, and `modules/ordering` each own a
+Postgres schema (`catalog.*`, `inventory.*`, `ordering.*`) and expose a
+public interface via their `index.ts`. Code outside a module only imports
+from that `index.ts` — never a module's internal `src/*` files, and never
+another module's tables directly. See `DECISIONS.md` for how event + seat
+creation stays atomic across modules without becoming a saga, and for the
+retry-loop design behind seat holding under contention.
+
+## Sweeper
+
+A background sweeper (`modules/ordering/src/sweeper.ts`) runs every
+`SWEEP_INTERVAL_MS` (default 5000) and expires reservations whose hold has
+passed, releasing their seats back to `AVAILABLE`. Started in
+`apps/api/src/server.ts`, not inside `buildApp` — tests call
+`runSweepOnce` directly instead of waiting on the timer.
 
 ## Status
 
@@ -100,5 +114,9 @@ atomic across the two modules without becoming a saga.
 
 **M1 — Catalog + inventory: done.** Admin CRUD for events, seat rows
 generated on create, customer event listing, sale-window check
-(`isSaleWindowOpen`) built and boundary-tested for M2's reservation
-endpoint to use. Next: M2 — holds and expiry.
+(`isSaleWindowOpen`).
+
+**M2 — Holds and expiry: done.** `POST /reservations` holds seats for 5
+minutes via a retry-loop conditional UPDATE (see `DECISIONS.md`), a
+sweeper releases expired holds. 50-concurrent-requests-for-10-seats race
+test passes repeatably. No payment yet — that's M3.

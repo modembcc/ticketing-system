@@ -34,3 +34,10 @@ export class SeatsUnavailableError extends Error {
     this.name = "SeatsUnavailableError";
   }
 }
+
+export class ReservationNotAwaitingPaymentError extends Error {
+  constructor(reservationId: string) {
+    super(`reservation ${reservationId} is no longer awaiting payment`);
+    this.name = "ReservationNotAwaitingPaymentError";
+  }
+}

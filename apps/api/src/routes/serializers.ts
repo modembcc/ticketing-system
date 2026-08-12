@@ -1,5 +1,6 @@
 import type { Event } from "../../../../modules/catalog/index.js";
 import type { Reservation } from "../../../../modules/ordering/index.js";
+import type { Payment } from "../../../../modules/payments/index.js";
 
 export function serializeEvent(event: Event, availableSeats: number) {
   return {
@@ -23,7 +24,22 @@ export function serializeReservation(reservation: Reservation) {
     seatIds: reservation.seatIds,
     state: reservation.state,
     heldUntil: reservation.heldUntil.toISOString(),
+    paymentId: reservation.paymentId,
+    amountCents: reservation.amountCents,
     createdAt: reservation.createdAt.toISOString(),
     updatedAt: reservation.updatedAt.toISOString(),
+  };
+}
+
+export function serializePayment(payment: Payment) {
+  return {
+    id: payment.id,
+    reservationId: payment.reservationId,
+    status: payment.status,
+    amountCents: payment.amountCents,
+    providerRef: payment.providerRef,
+    confirmedAt: payment.confirmedAt ? payment.confirmedAt.toISOString() : null,
+    createdAt: payment.createdAt.toISOString(),
+    updatedAt: payment.updatedAt.toISOString(),
   };
 }

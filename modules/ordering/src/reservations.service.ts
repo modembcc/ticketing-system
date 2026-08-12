@@ -2,14 +2,17 @@ import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
 import { findEventById, isSaleWindowOpen, saleWindowStatus } from "../../catalog/index.js";
 import { holdSeatsForEvent } from "../../inventory/index.js";
+import { confirmPayment, createPaymentIntent, findPaymentById, PaymentNotFoundError } from "../../payments/index.js";
 import { withTransaction } from "../../../platform/db/withTransaction.js";
 import {
   EventNotFoundError,
+  ReservationNotAwaitingPaymentError,
   ReservationValidationError,
   SaleWindowClosedError,
   SeatsUnavailableError,
 } from "./errors.js";
-import { insertReservation } from "./reservations.repository.js";
+import { calculateAmountCents } from "./pricing.js";
+import { attachPayment, findReservationById, insertReservation } from "./reservations.repository.js";
 import type { CreateReservationInput, Reservation } from "./types.js";
 
 const HOLD_DURATION_MS = 5 * 60 * 1000;
@@ -52,12 +55,44 @@ export async function createReservation(pool: Pool, input: CreateReservationInpu
       throw new SeatsUnavailableError(input.seatCount, held.length);
     }
 
-    return insertReservation(client, {
+    // Reservation must exist before the payment row can FK to it, so intent
+    // creation is a deliberate follow-up statement, not part of one INSERT.
+    // Both happen in this same transaction, so a failure at either step
+    // rolls back the seat hold too — the "compensation" for these two
+    // compensatable saga steps is just a plain rollback, nothing fancier.
+    await insertReservation(client, {
       id: reservationId,
       eventId: input.eventId,
       customerId: input.customerId,
       seatIds: held.map((seat) => seat.id).sort(),
       heldUntil,
     });
+
+    const amountCents = calculateAmountCents(input.seatCount);
+    const payment = await createPaymentIntent(client, { reservationId, amountCents });
+
+    return attachPayment(client, { reservationId, paymentId: payment.id, amountCents });
+  });
+}
+
+// Customer submits payment ("confirm" — this is what starts the fake
+// gateway's async processing; createReservation only opened the intent).
+// Rejects confirming a reservation that isn't waiting on payment anymore
+// (already expired, already settled) rather than letting the customer pay
+// into a dead reservation.
+export async function confirmReservationPayment(pool: Pool, paymentId: string): Promise<Reservation> {
+  return withTransaction(pool, async (client) => {
+    const payment = await findPaymentById(client, paymentId);
+    if (!payment) {
+      throw new PaymentNotFoundError(paymentId);
+    }
+
+    const reservation = await findReservationById(client, payment.reservationId);
+    if (!reservation || reservation.state !== "AWAITING_PAYMENT") {
+      throw new ReservationNotAwaitingPaymentError(payment.reservationId);
+    }
+
+    await confirmPayment(client, paymentId);
+    return reservation;
   });
 }

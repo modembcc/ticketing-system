@@ -114,3 +114,107 @@ exists. Columns like `amount_cents`, `payment_id`, `idempotency_key`, and
 states like `PAID`/`FULFILLED` are left out of the M2 migration and will
 arrive via `ALTER TABLE` in M3/M4 when the payment saga actually needs
 them — same "don't build schema ahead of its milestone" call made for M1.
+
+## 2026-08-12 — Correction: the M2 sweeper's batching claim above was wrong
+
+The 2026-08-11 sweeper entry claimed "batching doesn't weaken the
+guarantee" that the conditional `WHERE state='AWAITING_PAYMENT' AND
+held_until<now()` predicate makes race condition #2 safe. That was true
+only as long as nothing else could ever concurrently write to the same
+row — which stopped being true the moment M3 added a second writer (the
+payment pivot). Caught by a Plan-agent review before M3's race test was
+even written, not after:
+
+`runSweepOnce`'s bulk statement is `UPDATE ... WHERE id IN (SELECT id
+FROM reservations WHERE state='AWAITING_PAYMENT' AND held_until<now()
+LIMIT $1) RETURNING ...`. The subquery is evaluated once, up front, as a
+non-locking read, producing a fixed set of ids. When the outer UPDATE has
+to wait for a row lock held by a concurrent transaction (here: the
+payment pivot transitioning that same reservation to `PAID`), Postgres
+re-checks the row after the wait (`EvalPlanQual`) — but it only re-checks
+the *outer* WHERE clause (`id IN <fixed set>`), never re-running the
+inner subquery's `state='AWAITING_PAYMENT'` filter. So a reservation that
+just won the pivot race (now `PAID`/`FULFILLED`) could still get
+clobbered back to `EXPIRED` by a sweeper batch that captured it as a
+candidate a moment earlier.
+
+Fix (`modules/ordering/src/reservations.repository.ts`,
+`expireDueReservations`): duplicate the guard into the *outer* WHERE too
+(`AND state='AWAITING_PAYMENT' AND held_until<now()`), so it gets
+independently re-checked by `EvalPlanQual` exactly like a plain
+single-row conditional UPDATE would. No-op 99.99% of the time; required
+for the sweeper-vs-payment race to be reliable rather than usually-safe.
+General rule for this codebase going forward: conditional-update dedup
+for concurrent state transitions only holds for `WHERE id=$1 AND
+state=$2`-shaped updates — a subquery/batch-selected bulk update must
+repeat its guard in the outer WHERE or it silently loses this property.
+
+## 2026-08-12 — M3 pivot and fulfillment: two transactions, not one
+
+`tryTransitionToPaid` (the pivot — flips `AWAITING_PAYMENT` → `PAID`) and
+`fulfillPaidReservation` (issue tickets, flip seats to `SOLD`, flip `PAID`
+→ `FULFILLED`) are deliberately separate `withTransaction` calls in
+`modules/ordering/src/settle.ts`, not one. Bundling them looked
+appealing (there's no message queue yet, nothing external can fail
+issuing a ticket row) but has a real failure mode even in this fake
+system: if fulfillment ever had to be retried and shared a transaction
+with the pivot, a retry failure would roll the PAID transition back too
+— leaving a reservation that reads `AWAITING_PAYMENT` again with a
+payment that's already `SUCCEEDED`. If enough time passes before the
+next retry, the hold expires, the sweeper claims it, and a later tick
+routes a successfully-captured payment down the expensive REFUNDING path
+for no reason. That's the exact "unhappy pivot" mistake the project
+exists to teach against — so the split stands even without a queue yet.
+Fulfillment is built to be safely re-run (ticket insertion is
+`ON CONFLICT (seat_id) DO NOTHING` + re-fetch; seat-sold and the
+`PAID→FULFILLED` flip are both conditional updates), and the payment
+poller's candidate query includes reservations stuck in `PAID` so a
+partial failure gets retried on the next tick.
+
+## 2026-08-12 — Fake gateway: two independent timers, not one
+
+`modules/payments`'s gateway simulator (resolves confirmed `PENDING`
+intents to `SUCCEEDED` after a fake processing delay) and
+`modules/ordering`'s payment poller (notices terminal payments and
+advances the reservation) run on two separate `setInterval`s, started
+independently in `server.ts`. Collapsing them into one tick was tempting
+but conflates two roles the spec keeps distinct: the gateway simulator
+stands in for an external, out-of-process actor (Stripe's own
+processing), and it's not the orchestrator's job to advance that actor's
+clock — only to observe it, matching "poll, don't webhook."
+
+## 2026-08-12 — Payment poller keeps an in-memory backoff schedule
+
+`modules/ordering/src/payment-poller.ts` tracks per-reservation poll
+attempts in a plain `Map`, following the spec's explicit 1s/2s/3s/5s...
+capped schedule (never scheduled past a reservation's `held_until`)
+rather than just re-checking every candidate on every tick. This is
+intentionally not persisted — a process restart re-seeds every candidate
+for immediate polling, which is harmless (the schedule is a pacing
+hint, not a source of truth; the database rows are that). Chosen over
+the simpler flat-sweep approach because the spec calls out the backoff
+schedule in enough detail to read as deliberate pedagogy (realistic
+external-call polling), not incidental color.
+
+## 2026-08-12 — Race test: deadline offsets, not hoped-for wall-clock jitter
+
+The M3 sweeper-vs-payment race test (`apps/api/test/
+sweeper-vs-payment-race.test.ts`) does not rely on real timing jitter to
+sample both outcomes. `tryTransitionToPaid`'s guard requires
+`held_until>=now()`; the sweeper's requires `held_until<now()` — for a
+fixed timestamp those are a strict partition of a single instant, so a
+`held_until` already in the past makes a `FULFILLED` outcome
+*structurally* impossible (not just unlikely) no matter how the two
+transactions interleave, and a `held_until` far in the future makes
+`REFUNDED` structurally impossible. An earlier draft set `held_until` a
+full second in the past for every iteration and got deterministic,
+uninteresting `EXPIRED`-only results (worse: a few iterations got stuck
+in `EXPIRED` because a single `settlePaidPayment` call, like a single
+poller tick, can lose a narrow timing window and needs a follow-up call
+to resolve — the test now simulates that follow-up explicitly, the same
+way the real poller's next tick would). The fixed test instead runs
+three deliberate buckets per 100 iterations — generous positive offset
+(payment should win), offset already past (sweeper should win), and a
+tight ~15ms offset raced concurrently (genuine contention, the scenario
+that actually exercises the `EvalPlanQual` fix above) — guaranteeing
+both outcomes are observed on every run instead of hoping for it.

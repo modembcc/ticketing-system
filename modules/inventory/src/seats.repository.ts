@@ -141,3 +141,21 @@ export async function releaseSeats(db: Queryable, { seatIds, holdId }: ReleaseSe
   );
   return rowCount ?? 0;
 }
+
+export interface MarkSeatsSoldInput {
+  seatIds: string[];
+  holdId: string;
+}
+
+// Guarded by hold_id + status='HELD' so a retried fulfillment (ticket issuance
+// re-run after a partial failure) is a safe no-op the second time through.
+export async function markSeatsSold(db: Queryable, { seatIds, holdId }: MarkSeatsSoldInput): Promise<number> {
+  if (seatIds.length === 0) return 0;
+  const { rowCount } = await db.query(
+    `UPDATE inventory.seats
+     SET status = 'SOLD', version = version + 1
+     WHERE id = ANY($1) AND hold_id = $2 AND status = 'HELD'`,
+    [seatIds, holdId],
+  );
+  return rowCount ?? 0;
+}

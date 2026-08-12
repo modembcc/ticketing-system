@@ -4,6 +4,7 @@ export {
   generateSeats,
   holdSeatsForEvent,
   listSeatsByEvent,
+  markSeatsSold,
   releaseSeats,
 } from "./src/seats.repository.js";
-export type { HoldSeatsForEventInput, ReleaseSeatsInput } from "./src/seats.repository.js";
+export type { HoldSeatsForEventInput, MarkSeatsSoldInput, ReleaseSeatsInput } from "./src/seats.repository.js";

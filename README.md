@@ -25,6 +25,8 @@ runs pending migrations on boot.
 - API: http://localhost:3000
 - RabbitMQ management UI: http://localhost:15672 (guest/guest)
 - Postgres: localhost:5432 (ticketing/ticketing)
+- Mail: `./mail/*.eml` on the host (bind-mounted — no real SMTP, see
+  "Outbox + notify" below)
 
 Health checks:
 
@@ -194,6 +196,53 @@ built and tested at the repository level
 (`markMessageProcessed`) — there's no real message consumer to exercise
 it against yet; that's M5.
 
+## Outbox + notify (M5)
+
+RabbitMQ has been running since M0 but M5 is the first milestone that
+actually publishes or consumes a message. `platform/broker` (flat, same
+shape as `platform/idem`) is a thin `amqplib` connection helper shared
+by the publisher and consumer sides — one topic exchange
+(`domain-events`), routing key = event type. `platform/outbox` owns
+`outbox.events` (`id, aggregate_type, aggregate_id, event_type, payload,
+created_at, published_at`, no FK on `aggregate_id` — it's deliberately
+polymorphic, see `DECISIONS.md`) and the relay:
+
+- **Relay** (`platform/outbox/relay.ts`, `RELAY_INTERVAL_MS`, default
+  200) — one transaction per tick: `FOR UPDATE SKIP LOCKED` claims up
+  to 100 unpublished rows in `created_at` order, publishes each on a
+  **confirm channel**, `await`s `waitForConfirms()`, then marks
+  `published_at` — all before committing. A plain (non-confirm) channel
+  publish only means "written to the local TCP buffer," not "the
+  broker has it"; without confirms, a dropped connection right after
+  publish would mark a message published that the broker never
+  actually received — the exact failure the outbox pattern exists to
+  prevent, just moved one layer up. See `DECISIONS.md`.
+- **`modules/notify`** — no Postgres schema of its own (its only
+  persistent state is the shared `processed_messages` table). Declares
+  and binds its own queue (`notify.email`) at startup — **before** the
+  relay ever publishes, or the first events would be silently dropped
+  by an exchange with nothing bound to it yet (also in
+  `DECISIONS.md`). `runNotifyConsumeOnce` polls with `channel.get`
+  (bounded to 100 per tick) rather than a long-lived `channel.consume`
+  subscription, matching this project's testable `runXOnce` convention
+  everywhere else. Dedupes redelivered messages via
+  `processed_messages` before writing a `.eml` file to `MAIL_DIR`
+  (default `./mail`, bind-mounted in Compose) — no real SMTP, same
+  fake-gateway philosophy as `modules/payments`.
+
+Both are started in `server.ts` alongside the M2–M4 background workers,
+with topology setup explicitly awaited first.
+
+**Acceptance test** (`apps/api/test/outbox-notify.test.ts`): a real
+child process (`apps/api/test/fixtures/crash-before-publish.ts`, spawned
+via `spawnSync` with `--import tsx/esm`) runs the actual fulfillment
+flow through to a committed outbox row, then calls `process.exit(1)`
+before ever touching the relay or RabbitMQ. The parent test confirms
+the event survived unpublished, then recovers it with a fresh relay
+tick and confirms the email gets written — literally proving a process
+can die between commit and publish without losing the event, not just
+asserting Postgres durability in the abstract.
+
 ## Status
 
 **M0 — Scaffold: done.**
@@ -219,4 +268,12 @@ replays verbatim (success or business error alike), a different body
 under the same key is `422`, a concurrent duplicate mid-flight is `409`.
 10-concurrent-identical-requests test converges to one reservation and
 ten identical responses. `processed_messages` built and tested for M5's
-consumers to use. Next: M5 — outbox + notifications.
+consumers to use.
+
+**M5 — Outbox + notifications: done.** RabbitMQ actually wired up for
+the first time — a relay publishes outbox rows on a confirm channel,
+`modules/notify` consumes and writes `.eml` files, deduped via
+`processed_messages`. A real child process spawned mid-test and
+`process.exit(1)`'d between commit and publish proves the event
+survives and still gets delivered after "restart." Next: M6 — retries
++ DLQ.

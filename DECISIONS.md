@@ -308,3 +308,110 @@ fresh one per call, 49 of the 50 requests would collapse into
 `409 SeatsUnavailableError` the test exists to exercise, and the test
 would pass for the wrong reason. Confirmed the default-parameter pattern
 avoids this before relying on it.
+
+## 2026-08-13 — Outbox publish uses a confirm channel, not a plain one
+
+A first draft published on a plain amqplib channel and treated
+`channel.publish()` returning without throwing as "sent," then committed
+`published_at`. That reasoning has a real hole: a plain channel's
+`publish()` returns once the frame is written to the local TCP buffer —
+it does not mean the broker has the message. A dropped connection
+between that write and the broker actually processing the frame loses
+the event with no trace, even though `channel.publish()` "succeeded."
+That's exactly the failure the outbox pattern exists to prevent
+("the process can die between commit and publish, and the event is
+lost forever with no trace") — a confirm-less relay just moves the same
+hole one layer up, from "commit vs. publish" to "publish() returns vs.
+broker actually has it." Fixed: `platform/broker/connection.ts`'s
+publisher channel is `connection.createConfirmChannel()`, and
+`platform/outbox/relay.ts` `await`s `channel.waitForConfirms()` after
+publishing a batch, before marking `published_at`. Caught by a
+Plan-agent review before this was built the confirm-less way, not
+after.
+
+## 2026-08-13 — Notify's queue/binding must exist before the relay's first tick
+
+A topic exchange with no bound queue silently drops anything published
+to it — and a confirm channel's ack only means "the broker accepted
+it," not "a queue durably has it," so the confirms fix above doesn't
+catch this. If `startRelay` and `modules/notify`'s queue declaration
+were two independently-timed things (which is how every other
+background worker in this project is wired in `server.ts` — no
+ordering between them), the very first events published before
+`notify` has run `assertQueue`/`bindQueue` would be lost forever,
+`published_at = true` and all. Fixed by making topology setup an
+explicit, awaited step in `server.ts` (and in `outbox-notify.test.ts`'s
+`beforeAll`) that happens *before* `startRelay` is called, not something
+left to `notify`'s own poll tick to establish on its own schedule.
+
+## 2026-08-13 — Outbox insert in `fulfillPaidReservation` is guarded, not unconditional
+
+`fulfillPaidReservation` is explicitly designed to be safely re-entered
+after a partial failure — ticket issuance is `ON CONFLICT DO NOTHING`,
+seat-sold and the `PAID`→`FULFILLED` flip are both conditional updates.
+An outbox insert isn't naturally idempotent the same way, so it's
+gated on `tryMarkFulfilled`'s actual return value
+(`if (fulfilled) { await insertOutboxEvent(...) }`), not run
+unconditionally after the call. Same shape as the M4 savepoint bug and
+the M2/M3 `EvalPlanQual` bug already in this file: bolting a new,
+non-idempotent side effect onto an existing idempotent primitive
+without re-deriving the guard. Caught in design review this time, not
+by a failing test — worth noting the pattern is recurring enough now to
+watch for deliberately on every new side effect added to an
+already-idempotent function.
+
+## 2026-08-13 — Ordering holds because of one queue and sequential draining, not routing keys
+
+The spec says "partition/route by `aggregate_id` so per-reservation
+ordering holds." At M5's scale (one event type, one consumer, no
+consistent-hash-exchange plugin installed) nothing here actually
+partitions by `aggregate_id` — the relay's topic exchange routes by
+`event_type`. Per-reservation ordering holds for a boring reason that
+has nothing to do with the routing key: the relay claims and publishes
+rows in `created_at` order inside one transaction, there's exactly one
+queue (`notify.email`), and one consumer drains it sequentially
+(`get` → `ack` → next, no prefetch/pipelining, no competing consumers).
+Worth being precise about this rather than claiming the routing key
+delivers ordering — it doesn't, and a second consumer or a
+competing-consumers setup in a later milestone would break that claim
+immediately if it were ever relied on.
+
+## 2026-08-13 — RabbitMQ connection needs its own retry, not just `depends_on: service_healthy`
+
+First `docker compose up` from a clean volume failed at boot with
+`ECONNREFUSED` on port 5672, despite `depends_on: rabbitmq: condition:
+service_healthy` already being satisfied. RabbitMQ's healthcheck
+(`rabbitmq-diagnostics -q ping`) checks the Erlang node's
+responsiveness, which can go green a moment before the AMQP listener
+itself is actually accepting connections — a real startup race, not a
+hypothetical one. Fixed with a small connect-with-retry loop in
+`platform/broker/connection.ts` (10 attempts, 1s apart) rather than
+tightening the healthcheck further; the same fix also makes local dev
+(`npm run dev` against a `docker compose up`'d Postgres/RabbitMQ that's
+still warming up) more forgiving.
+
+## 2026-08-13 — Crash-recovery test spawns a real child process
+
+The acceptance bar is unusually specific: "killing the app between
+commit and publish (a deliberate `process.exit` in a test hook) still
+delivers the email after restart." Read literally rather than loosely
+— matching how this project already treats other specifically-worded
+spec details (e.g. the M3 payment backoff schedule) as deliberate, not
+incidental. A same-process version ("just don't call `runRelayOnce`
+yet, call it later") can't distinguish "the process actually died" from
+"the code path was simply never reached," which is a materially weaker
+claim, and Postgres commit durability is already assumed everywhere
+else in this suite — this is the one milestone whose entire point is
+proving a process really can die and the data survives.
+`apps/api/test/fixtures/crash-before-publish.ts` runs the real
+fulfillment flow (event → reservation → paid → fulfilled, via direct
+module calls, no HTTP) against `DATABASE_URL` from the environment,
+then calls `process.exit(1)` immediately — never touching the relay or
+RabbitMQ. The parent test spawns it with `spawnSync(process.execPath,
+["--import", "tsx/esm", scriptPath], {...})` (no shell, no `.bin` shim,
+identical behavior on Windows/Linux/CI), asserts the exit code, then
+recovers via a fresh `runRelayOnce` in the parent process. The fixture
+writes its sentinel line with `fs.writeSync(1, ...)`, not
+`console.log` — stdout to a pipe is non-blocking on Windows, so a
+`console.log` immediately followed by `process.exit()` can truncate
+before the parent ever sees it.

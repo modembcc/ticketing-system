@@ -32,6 +32,7 @@ services:
       DATABASE_URL: postgres://ticketing:ticketing@postgres:5432/ticketing
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
       PORT: 3000
+      MAIL_DIR: /usr/src/app/mail
     ports:
       - "3000:3000"
     volumes:

@@ -2,6 +2,7 @@ import type { Pool, PoolClient } from "pg";
 import { markSeatsSold, releaseSeats } from "../../inventory/index.js";
 import { refundPayment } from "../../payments/index.js";
 import { withTransaction } from "../../../platform/db/withTransaction.js";
+import { insertOutboxEvent } from "../../../platform/outbox/repository.js";
 import {
   findReservationById,
   markRefunded,
@@ -39,6 +40,26 @@ export async function fulfillPaidReservation(pool: Pool, reservationId: string):
     });
     await markSeatsSold(client, { seatIds: reservation.seatIds, holdId: reservation.id });
     const fulfilled = await tryMarkFulfilled(client, reservationId);
+
+    // Guarded by `fulfilled` (not unconditional): this function is meant to
+    // be safely re-entered after a partial failure — every write above is
+    // already idempotent, but an outbox insert isn't naturally idempotent,
+    // so an unconditional insert here would send a duplicate confirmation
+    // email on every redundant re-entry even though nothing new happened.
+    if (fulfilled) {
+      await insertOutboxEvent(client, {
+        aggregateType: "reservation",
+        aggregateId: fulfilled.id,
+        eventType: "reservation.fulfilled",
+        payload: {
+          reservationId: fulfilled.id,
+          customerId: fulfilled.customerId,
+          seatIds: fulfilled.seatIds,
+          amountCents: fulfilled.amountCents,
+        },
+      });
+    }
+
     return fulfilled ?? reservation;
   });
 }

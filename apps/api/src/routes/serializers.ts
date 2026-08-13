@@ -1,6 +1,7 @@
 import type { Event } from "../../../../modules/catalog/index.js";
 import type { Reservation } from "../../../../modules/ordering/index.js";
 import type { Payment } from "../../../../modules/payments/index.js";
+import type { DlqEntry } from "../../../../platform/dlq/repository.js";
 
 export function serializeEvent(event: Event, availableSeats: number) {
   return {
@@ -41,5 +42,22 @@ export function serializePayment(payment: Payment) {
     confirmedAt: payment.confirmedAt ? payment.confirmedAt.toISOString() : null,
     createdAt: payment.createdAt.toISOString(),
     updatedAt: payment.updatedAt.toISOString(),
+  };
+}
+
+export function serializeDlqEntry(entry: DlqEntry) {
+  return {
+    id: entry.id,
+    sourceQueue: entry.sourceQueue,
+    consumer: entry.consumer,
+    messageId: entry.messageId,
+    payload: entry.payload,
+    failureReason: entry.failureReason,
+    attemptCount: entry.attemptCount,
+    brokerHeaders: entry.brokerHeaders,
+    createdAt: entry.createdAt.toISOString(),
+    replayedAt: entry.replayedAt ? entry.replayedAt.toISOString() : null,
+    discardedAt: entry.discardedAt ? entry.discardedAt.toISOString() : null,
+    discardReason: entry.discardReason,
   };
 }

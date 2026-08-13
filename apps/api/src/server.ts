@@ -30,13 +30,16 @@ const mailDir = process.env.MAIL_DIR ?? "./mail";
 await runMigrations(connectionString);
 
 const pool = new Pool({ connectionString });
-const app = buildApp({ pool });
 
 const publisherChannel = await createPublisherChannel(rabbitmqUrl);
 const consumerChannel = await createConsumerChannel(rabbitmqUrl);
 // Must exist before the relay ever publishes — an exchange with no bound
 // queue silently drops messages, confirms and all. See DECISIONS.md.
 await ensureNotifyQueue(consumerChannel);
+
+// publisherChannel is needed by POST /admin/dlq/:id/replay, so the app is
+// built after the broker channels exist rather than before.
+const app = buildApp({ pool, publisherChannel });
 
 const stopSweeper = startSweeper(pool, sweepIntervalMs);
 const stopGatewaySimulator = startGatewaySimulator(pool, gatewayTickIntervalMs);

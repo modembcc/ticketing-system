@@ -10,6 +10,8 @@ export interface ReservationFulfilledPayload {
 
 export interface DomainEventEnvelope {
   id: string;
+  aggregateType?: string;
+  aggregateId?: string;
   eventType: string;
   payload: unknown;
   createdAt: string;

@@ -415,3 +415,125 @@ writes its sentinel line with `fs.writeSync(1, ...)`, not
 `console.log` — stdout to a pipe is non-blocking on Windows, so a
 `console.log` immediately followed by `process.exit()` can truncate
 before the parent ever sees it.
+
+## 2026-08-13 — Retry delay is per-message `expiration`, not queue-level `x-message-ttl`
+
+First draft gave each of the 5 retry-tier queues a fixed `x-message-ttl`
+argument matching its backoff step. That's structurally incompatible
+with the spec's own requirement of jitter *and* with
+`ensureNotifyQueue` needing to stay safe to call on every process
+restart: `assertQueue` throws `PRECONDITION_FAILED` if a queue already
+exists with different `arguments` than last time, so a queue-level TTL
+can never vary per-process-start, let alone per-message — jitter simply
+cannot be expressed that way. Caught by a Plan-agent review before this
+was built the fixed-TTL way, not after.
+
+Fixed: the retry queues carry only their dead-letter routing
+(`x-dead-letter-exchange`/`-routing-key`, fixed forever, safe to
+redeclare identically on every restart); the actual delay is set per
+message via the `expiration` property at publish time
+(`modules/notify/src/consumer.ts`), jittered there
+(`topology.ts`'s `withJitter`, ±20%). This reopens a narrower version
+of the exact hazard fixed-TTL-per-tier was chosen to avoid in the first
+place (a queue only expires messages at its head, so a shorter-TTL
+message queued behind a longer-TTL one waits) — but now bounded to
+±20% of one tier's own delay, not the ~16x skew a single shared queue
+across all five tiers would have risked. Worth the tradeoff; the spec
+asks for both backoff *and* jitter, and this is the only design here
+that delivers both without breaking restart-safety.
+
+## 2026-08-13 — Republishing to a retry tier must spread the original headers
+
+A first draft's republish set `headers: {"x-retry-count": attempt}` —
+overwriting, not extending, `msg.properties.headers`. A republish is a
+brand-new AMQP publish, not a dead-letter event; nothing carries
+forward automatically, so this would have silently discarded any
+`x-death` history RabbitMQ had already attached from earlier retry-tier
+hops (real, broker-populated redelivery metadata, not something this
+codebase constructs — useful for debugging exactly how a message got to
+the DLQ). Fixed to `headers: { ...msg.properties.headers, "x-retry-count": nextRetryCount }`.
+The DLQ's `broker_headers` column captures whatever accumulated by the
+time a message actually lands there.
+
+## 2026-08-13 — "Max 5 attempts" read as 5 retries (6 total), all 5 backoff tiers used
+
+The spec lists exactly 5 backoff delays (1s/2s/4s/8s/16s) and says "max
+5 attempts." Genuinely ambiguous between "5 total attempts" (would
+leave the 16s tier permanently unused — the 5 delays would only be
+needed to reach attempt 5 if 4 of them are consumed, not 5) and "5
+retries after the original" (6 total deliveries, all 5 tiers used
+exactly once each). Took the second reading — it's the one where every
+listed backoff number does something, and it's what
+`modules/notify/src/consumer.ts` implements: a message that fails on
+attempt 6 (the original plus all 5 retries exhausted) lands in the DLQ
+with `attempt_count = 6`. `apps/api/test/notify-retry-dlq.test.ts`
+asserts this exact number rather than a loose bound, specifically so
+the ambiguity can't silently regress to a different reading later.
+
+## 2026-08-13 — DLQ storage is Postgres, not a RabbitMQ queue
+
+`GET /admin/dlq`/`replay`/`discard` need per-entry list/filter/replay/
+discard with a permanent audit trail — awkward to build against
+RabbitMQ's own management HTTP API, which isn't meant for this kind of
+per-message business operation. Every other durable, queryable piece of
+state in this project already lives in Postgres with RabbitMQ purely as
+transport (the outbox itself is the precedent); `dlq.entries` keeps
+that boundary consistent instead of introducing a second source of
+truth. A partial unique index on `(message_id, consumer)` scoped to
+unresolved rows absorbs the one real duplicate-row risk in this design:
+if the process crashes between inserting the DLQ row and acking the
+original delivery, RabbitMQ redelivers the un-acked message and the
+consumer would otherwise insert a second row for the same failure —
+`ON CONFLICT ... DO NOTHING` makes that a no-op. Once an entry is
+replayed or discarded, a later failure of the same message id is a new
+failure episode and correctly gets a fresh row (the index only covers
+unresolved entries).
+
+## 2026-08-13 — Terminal classification is centralized, not just "catch JSON.parse"
+
+The spec's terminal list is "malformed payload, unknown event type,
+**validation failure**" — three cases, not two. A first draft only
+special-cased bad JSON and an unrecognized `eventType`; a
+syntactically-valid envelope with a wrong-shaped `payload` (e.g.
+`amountCents` as a string) would have thrown a plain `TypeError` deep
+inside the mailer, been classified retriable by default, and burned all
+5 retries before landing in the DLQ — the exact "unknown terminal case
+masquerading as transient" risk the spec calls out as "the most common
+real-world DLQ bug." Caught by a Plan-agent review, not by a failing
+test. Fixed by centralizing all three checks in one place
+(`modules/notify/src/classify.ts`'s `parseNotifyEvent`) — the single
+spot a reviewer checks for "did they get the retriable/terminal split
+right" — and using payload-shape validation (not just malformed bytes)
+as the more realistic `email.malformed_payload`-style scenario in
+`apps/api/test/notify-retry-dlq.test.ts`.
+
+## 2026-08-13 — Simulating transient failures via dependency injection, not a payload flag
+
+`runNotifyConsumeOnce` takes an optional `handleEvent` override (default:
+the real `writeEmailFile`) rather than tests embedding a
+"fail N times then succeed" flag inside the outbox event's payload. A
+payload flag is frozen once the message is published — a test proving
+"DLQ due to genuine exhaustion, then the underlying issue gets fixed,
+then replay succeeds" needs the *replayed* delivery to behave
+differently from the original, which a byte-identical payload can't
+express. Modeling the fault as external, mutable test state (a closure
+counter) instead is also the more honest simulation: a real transient
+failure is a property of the environment at the time ("some downstream
+dependency was down and came back"), not of the message itself.
+Production code never passes this option — the default argument is the
+real behavior, zero footprint outside tests.
+
+## 2026-08-13 — `buildApp`'s `publisherChannel` is optional
+
+`POST /admin/dlq/:id/replay` needs a channel to requeue onto, but making
+one a required `buildApp` parameter would force all 9 other test files
+(none of which touch RabbitMQ) to each pay for a broker Testcontainer
+they never use. `BuildAppOptions.publisherChannel` is optional; the
+replay route 503s if it's missing rather than the route being
+conditionally registered — keeps route registration static and
+identical across environments, only the runtime dependency is
+optional. Same reasoning extends `waitForConfirms()` to the replay path
+(publish → confirm → only then mark `replayed_at`) — skipping it would
+risk marking an entry replayed that the broker never actually received,
+and unlike the outbox, a DLQ entry has no fallback layer behind it if
+that silently goes wrong.

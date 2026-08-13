@@ -90,6 +90,16 @@ Customer:
 - `GET /payments/:id` — fetch one payment. No idempotency key needed —
   it's a read.
 
+Admin (DLQ, M6):
+
+- `GET /admin/dlq` — list unresolved dead-lettered messages, with
+  `failureReason` and `attemptCount`
+- `POST /admin/dlq/:id/replay` — requeue to the source queue with a
+  fresh attempt budget; `404` if not found/already resolved, `503` if
+  the broker is unavailable
+- `POST /admin/dlq/:id/discard` — requires `{ "reason": "..." }`;
+  `400` without one. The row is never deleted — it's the audit log.
+
 ### Idempotency-Key
 
 Required on the two mutating customer endpoints above. Same key + same
@@ -243,6 +253,37 @@ tick and confirms the email gets written — literally proving a process
 can die between commit and publish without losing the event, not just
 asserting Postgres durability in the abstract.
 
+## Retries + DLQ (M6)
+
+`modules/notify/src/classify.ts` is the one place that decides
+retriable vs. terminal — malformed JSON, an unrecognized `eventType`,
+or a payload that fails shape validation all throw `TerminalMessageError`
+and skip straight to the DLQ; anything else is retried by default
+(a wrongly-terminal call silently drops a real transient failure
+forever, a wrongly-retriable one just burns retries before landing in
+the DLQ anyway — asymmetric risk, so default the safer way).
+
+Retries use 5 RabbitMQ queues (`notify.email.retry.1`…`5`, one per
+backoff tier: 1s/2s/4s/8s/16s ± 20% jitter), each dead-lettering back to
+`notify.email` on expiry — no community plugin required. The delay is
+set **per message** via the `expiration` property at publish time, not
+a fixed `x-message-ttl` on the queue, specifically so jitter is
+possible without breaking `ensureNotifyQueue`'s idempotent redeclaration
+on every restart (see `DECISIONS.md`). A message that fails on its 6th
+delivery (the original + all 5 retries) lands in `dlq.entries`
+(`platform/dlq`, own schema, no RabbitMQ-native DLQ — Postgres is the
+durable, queryable, admin-operable store, RabbitMQ stays pure
+transport) with the failure reason, exact attempt count, and whatever
+`x-death` history RabbitMQ attached along the way.
+
+Simulating "a downstream dependency is down and later recovers" (for
+`email.fail_transient(2)`-style scenarios) uses dependency injection —
+`runNotifyConsumeOnce`'s optional `handleEvent` override — rather than a
+flag baked into the message payload, because a replayed message is
+byte-identical to what's stored; a payload flag couldn't behave
+differently between the original failing attempt and a successful
+replay after the "fix." Production never passes this option.
+
 ## Status
 
 **M0 — Scaffold: done.**
@@ -275,5 +316,15 @@ the first time — a relay publishes outbox rows on a confirm channel,
 `modules/notify` consumes and writes `.eml` files, deduped via
 `processed_messages`. A real child process spawned mid-test and
 `process.exit(1)`'d between commit and publish proves the event
-survives and still gets delivered after "restart." Next: M6 — retries
-+ DLQ.
+survives and still gets delivered after "restart."
+
+**M6 — Retries + DLQ: done.** Exponential backoff with jitter via 5
+RabbitMQ delayed-retry queues, explicit terminal-vs-retriable
+classification, a Postgres-backed DLQ with admin list/replay/discard.
+A poison message (malformed JSON or an invalid payload shape) lands in
+the DLQ on the first attempt with no retries burned; a transient
+failure recovers on attempt 3; a permanent failure exhausts all 5
+retries (6 total attempts) without ever touching the already-fulfilled
+reservation's state; replay requeues with a fresh attempt budget and
+succeeds once the underlying issue is fixed. Next: M7 — chaos +
+scenario suite.

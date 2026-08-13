@@ -218,3 +218,93 @@ three deliberate buckets per 100 iterations — generous positive offset
 tight ~15ms offset raced concurrently (genuine contention, the scenario
 that actually exercises the `EvalPlanQual` fix above) — guaranteeing
 both outcomes are observed on every run instead of hoping for it.
+
+## 2026-08-13 — `platform/idem` is flat, not module-shaped
+
+`catalog`/`inventory`/`ordering`/`payments` each have `index.ts` +
+`src/*.ts` because they're business modules with a public interface
+other modules call into. `platform/idem` (like `platform/db` and
+`platform/migrate` before it) is cross-cutting infra, not a fifth
+module — the architecture doc names it `platform/idem` for a reason. It
+gets its own Postgres schema (`idem`) for the same "own schema per
+concern" reasoning as the business modules, but its files
+(`repository.ts`, `withIdempotency.ts`, `sweeper.ts`, `hash.ts`) sit
+flat with no `src/` and no barrel, imported by direct relative path —
+matching `platform/db/withTransaction.ts`'s existing shape, not the
+modules' shape. Caught before being built the other way, not after.
+
+## 2026-08-13 — Idempotency caches business errors too, not just success
+
+`withIdempotency`'s handler is expected to catch its own typed domain
+errors and return them as `{status, body}` rather than letting them
+propagate — so a `409 SeatsUnavailableError` or `422
+SaleWindowClosedError` gets recorded as the permanent, replayable
+outcome for that key exactly like a `201` would. Only a genuinely
+unexpected exception (not one of the endpoint's known error types) is
+allowed to propagate out of the handler, rolling back the transaction
+and leaving no idempotency record — so a legitimate retry after an
+infra failure isn't permanently poisoned. This matches the spec's own
+"Completed → replay the stored status and body verbatim," applied
+uniformly: an idempotency key represents one specific attempt, same
+model Stripe's own keys use. A client that wants a fresh attempt after
+a business-logic failure (e.g. seats sold out) sends a new key, not a
+retry of the old one.
+
+## 2026-08-13 — `createReservation`/`confirmReservationPayment` take a client, not a pool
+
+Both functions used to own their own `withTransaction(pool, ...)` call.
+M4 requires "insert the PENDING idempotency row in the same transaction
+as the work," which is only possible if something else owns that one
+transaction — so both were changed to accept an already-open
+`PoolClient` instead, and `withIdempotency` owns the transaction
+(PENDING insert → handler → COMPLETED update, all one commit-or-rollback
+unit). This isn't really "breaking" anything: every repository function
+these two call was already `Queryable`-typed and already called with a
+`client` today — these were the only two functions in `ordering` still
+opening their own transaction, so this makes them consistent with
+everything else rather than the odd ones out. Typed as `PoolClient`
+specifically (not `Queryable`, which also allows a bare `Pool`) so
+calling either function outside an open transaction is a compile error,
+not a runtime footgun — the whole point now depends on running inside
+someone else's transaction.
+
+## 2026-08-13 — Savepoint boundary around the actual work, inside the idempotency handler
+
+Moving the two functions above to take a `client` created a real bug,
+caught by the existing "409 when requesting more seats than the event
+has" test failing after the refactor (not by design review): `createReservation`
+can throw `SeatsUnavailableError` *after* `holdSeatsForEvent`'s retry
+loop has already committed-in-progress a few partial holds. Before M4,
+that throw unwound the function's own `withTransaction` and rolled
+everything back automatically. After M4, the route catches that error
+*inside* the handler passed to `withIdempotency` and returns a normal
+`{status: 409, body}` — which looks like clean success to the
+enclosing transaction, so it commits, partial seat holds included.
+
+Fix: `platform/db/withSavepoint.ts` wraps just the risky call
+(`withSavepoint(client, () => createReservation(client, input))`)
+inside each route's handler. A `SAVEPOINT` before the call and
+`ROLLBACK TO SAVEPOINT` on throw undoes only the work's partial writes,
+then rethrows so the route's existing `try/catch` can still convert it
+to a response — while the outer transaction (idempotency bookkeeping)
+commits normally around it. General rule going forward: any handler
+passed to `withIdempotency` that calls something capable of partial
+writes before throwing needs this savepoint boundary around that call,
+not just a try/catch.
+
+## 2026-08-13 — Idempotency-Key required means every M0–M3 test needed one
+
+Making the header required broke all four pre-existing integration test
+files at once (`reservations.test.ts`, `sweeper.test.ts`,
+`payment-saga.test.ts`, `sweeper-vs-payment-race.test.ts`) — every
+`reserve()`/`confirm()` helper started 400ing. Fixed by giving each
+helper a `randomUUID()` default parameter (evaluated fresh per call, so
+existing one-call-one-reservation test semantics are unchanged). The one
+place this needed care: M2's 50-concurrent-seat-race test, where 50
+different (fake) customers race for 10 scarce seats — if that test's
+helper accidentally shared one key across calls instead of generating a
+fresh one per call, 49 of the 50 requests would collapse into
+`409 Retry-Later` idempotency bounces instead of the real
+`409 SeatsUnavailableError` the test exists to exercise, and the test
+would pass for the wrong reason. Confirmed the default-parameter pattern
+avoids this before relying on it.

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Pool } from "pg";
@@ -47,7 +48,7 @@ describe("payment saga", () => {
     const res = await app.inject({
       method: "POST",
       url: "/reservations",
-      headers: { "x-customer-id": customerId },
+      headers: { "x-customer-id": customerId, "idempotency-key": randomUUID() },
       payload: { eventId, seatCount },
     });
     expect(res.statusCode).toBe(201);
@@ -60,8 +61,16 @@ describe("payment saga", () => {
     };
   }
 
-  async function confirm(paymentId: string) {
-    return app.inject({ method: "POST", url: `/payments/${paymentId}/confirm` });
+  // Fresh key by default so calling confirm() twice in a row (as the
+  // "idempotent no-op" test does explicitly) isn't the only path exercised —
+  // callers that specifically want to test idempotent-replay pass the same
+  // key twice themselves.
+  async function confirm(paymentId: string, idempotencyKey = randomUUID()) {
+    return app.inject({
+      method: "POST",
+      url: `/payments/${paymentId}/confirm`,
+      headers: { "idempotency-key": idempotencyKey },
+    });
   }
 
   async function backdatePaymentConfirmedAt(paymentId: string, msAgo: number) {

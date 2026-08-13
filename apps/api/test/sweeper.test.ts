@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Pool } from "pg";
@@ -46,7 +47,7 @@ describe("ordering: sweeper", () => {
     const res = await app.inject({
       method: "POST",
       url: "/reservations",
-      headers: { "x-customer-id": "cust-1" },
+      headers: { "x-customer-id": "cust-1", "idempotency-key": randomUUID() },
       payload: { eventId, seatCount },
     });
     expect(res.statusCode).toBe(201);

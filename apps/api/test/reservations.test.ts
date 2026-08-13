@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from "@testcontainers/postgresql";
 import { Pool } from "pg";
@@ -48,11 +49,15 @@ describe("ordering: reservations", () => {
     return res.json().id;
   }
 
-  function reserve(eventId: string, seatCount: number, customerId = "cust-1") {
+  // Fresh Idempotency-Key per call (default params evaluate per invocation)
+  // so each test's reservation attempt is its own logical request, and — for
+  // the 50-concurrent test below — so 50 different customers racing for
+  // scarce seats don't accidentally collapse into idempotency-key replay.
+  function reserve(eventId: string, seatCount: number, customerId = "cust-1", idempotencyKey = randomUUID()) {
     return app.inject({
       method: "POST",
       url: "/reservations",
-      headers: { "x-customer-id": customerId },
+      headers: { "x-customer-id": customerId, "idempotency-key": idempotencyKey },
       payload: { eventId, seatCount },
     });
   }
@@ -87,11 +92,23 @@ describe("ordering: reservations", () => {
     expect(available[0].count).toBe(3);
   });
 
+  it("rejects a missing Idempotency-Key header", async () => {
+    const eventId = await createEvent();
+    const res = await app.inject({
+      method: "POST",
+      url: "/reservations",
+      headers: { "x-customer-id": "cust-1" },
+      payload: { eventId, seatCount: 1 },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
   it("rejects a missing X-Customer-Id header", async () => {
     const eventId = await createEvent();
     const res = await app.inject({
       method: "POST",
       url: "/reservations",
+      headers: { "idempotency-key": randomUUID() },
       payload: { eventId, seatCount: 1 },
     });
     expect(res.statusCode).toBe(400);

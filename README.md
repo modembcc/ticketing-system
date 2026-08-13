@@ -72,16 +72,38 @@ Customer:
 
 - `GET /events` — list events, each with `availableSeats`
 - `POST /reservations` — hold N seats for 5 minutes (requires
-  `X-Customer-Id` header). Body: `{ "eventId": "...", "seatCount": 2 }`.
-  Seats are auto-assigned, not chosen by the customer. Response includes
-  `paymentId`/`amountCents` (a flat placeholder price — see
-  `DECISIONS.md`). `404` unknown event, `422` sale window not open, `409`
-  not enough seats available, `400` bad input.
-- `POST /payments/:id/confirm` — customer submits payment; starts the
-  fake gateway's async processing. Confirming twice is a no-op, not an
-  error. `404` unknown payment, `409` reservation no longer awaiting
-  payment (already expired/settled).
-- `GET /payments/:id` — fetch one payment.
+  `X-Customer-Id` **and** `Idempotency-Key` headers). Body:
+  `{ "eventId": "...", "seatCount": 2 }`. Seats are auto-assigned, not
+  chosen by the customer. Response includes `paymentId`/`amountCents` (a
+  flat placeholder price — see `DECISIONS.md`). `404` unknown event,
+  `422` sale window not open, `409` not enough seats available (or a
+  concurrent request with the same key still processing), `400` bad
+  input or missing `Idempotency-Key`.
+- `POST /payments/:id/confirm` — customer submits payment (requires
+  `Idempotency-Key`); starts the fake gateway's async processing.
+  Confirming twice with the same key replays the cached response;
+  confirming twice with different keys is still a no-op at the payment
+  level either way. `404` unknown payment, `409` reservation no longer
+  awaiting payment (already expired/settled).
+- `GET /payments/:id` — fetch one payment. No idempotency key needed —
+  it's a read.
+
+### Idempotency-Key
+
+Required on the two mutating customer endpoints above. Same key + same
+request body → the first response is cached and replayed verbatim on
+every retry, no matter how many times or what it was (success *or* a
+business error like `409`/`422` — see `DECISIONS.md` for why errors are
+cached too). Same key + a *different* body → `422`. A concurrent retry
+that arrives while the first attempt is still running → `409`
+("retry shortly", not a cached response). Keys expire after 24h and are
+swept (`platform/idem`, `IDEM_SWEEP_INTERVAL_MS`, default 60000).
+
+```
+curl -X POST http://localhost:3000/reservations \
+  -H "X-Customer-Id: cust-1" -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"eventId":"...","seatCount":2}'
+```
 
 `POST /admin/events` body:
 
@@ -144,6 +166,34 @@ duplicates its guard into the outer `WHERE` (not just an inner subquery)
 so it can't clobber a reservation that a concurrent payment pivot just
 won — see `DECISIONS.md` for the bug this fixes.
 
+## Idempotency (M4)
+
+`platform/idem` is cross-cutting infra, not a fifth business module — it
+sits flat (no `src/`, no barrel `index.ts`) matching `platform/db`'s
+shape, imported by direct path. `withIdempotency(pool, {key, endpoint,
+requestBody}, handler)` owns one transaction: insert the key row as
+`PENDING`, run `handler`, record its result as `COMPLETED` — all commit
+or roll back together. `handler` is expected to catch its own domain
+errors and return `{status, body}` rather than throwing, so business
+errors get cached and replayed like any other outcome; a genuinely
+unexpected exception is left to propagate, rolling everything back so a
+retry after an infra failure isn't permanently poisoned.
+
+Because of that same-transaction requirement, `createReservation` and
+`confirmReservationPayment` (`modules/ordering`) take an already-open
+`PoolClient` instead of a `Pool` — `withIdempotency` is what opens the
+transaction now. Each route wraps its call to them in
+`withSavepoint` (`platform/db/withSavepoint.ts`) so a business error
+thrown *after* partial writes (e.g. `SeatsUnavailableError` once some
+seats are already held) rolls back just that work, not the idempotency
+bookkeeping around it — see `DECISIONS.md` for the bug this fixes and
+why it only showed up after this refactor.
+
+`processed_messages` (the consumer-side equivalent, `idem` schema) is
+built and tested at the repository level
+(`markMessageProcessed`) — there's no real message consumer to exercise
+it against yet; that's M5.
+
 ## Status
 
 **M0 — Scaffold: done.**
@@ -161,5 +211,12 @@ test passes repeatably.
 `PAID → FULFILLED` with tickets issued and seats `SOLD`, compensation on
 failure (`FAILED`) and on expiry (`EXPIRED`), and the late-payment refund
 path (`REFUNDING → REFUNDED`). Sweeper-vs-payment race test passes
-reliably across repeated 100-run executions. No idempotency keys yet —
-that's M4.
+reliably across repeated 100-run executions.
+
+**M4 — Idempotency: done.** `Idempotency-Key` required on
+`POST /reservations` and `POST /payments/:id/confirm`; same key+body
+replays verbatim (success or business error alike), a different body
+under the same key is `422`, a concurrent duplicate mid-flight is `409`.
+10-concurrent-identical-requests test converges to one reservation and
+ten identical responses. `processed_messages` built and tested for M5's
+consumers to use. Next: M5 — outbox + notifications.

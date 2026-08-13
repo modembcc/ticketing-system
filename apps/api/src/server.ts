@@ -1,6 +1,7 @@
 import { Pool } from "pg";
 import { buildApp } from "./app.js";
 import { runMigrations } from "../../../platform/migrate/run.js";
+import { startIdemSweeper } from "../../../platform/idem/sweeper.js";
 import { startPaymentPoller, startSweeper } from "../../../modules/ordering/index.js";
 import { startGatewaySimulator } from "../../../modules/payments/index.js";
 
@@ -14,6 +15,7 @@ const host = process.env.HOST ?? "0.0.0.0";
 const sweepIntervalMs = Number(process.env.SWEEP_INTERVAL_MS ?? 5000);
 const gatewayTickIntervalMs = Number(process.env.GATEWAY_TICK_INTERVAL_MS ?? 1000);
 const paymentPollIntervalMs = Number(process.env.PAYMENT_POLL_INTERVAL_MS ?? 500);
+const idemSweepIntervalMs = Number(process.env.IDEM_SWEEP_INTERVAL_MS ?? 60_000);
 
 await runMigrations(connectionString);
 
@@ -22,11 +24,13 @@ const app = buildApp({ pool });
 const stopSweeper = startSweeper(pool, sweepIntervalMs);
 const stopGatewaySimulator = startGatewaySimulator(pool, gatewayTickIntervalMs);
 const stopPaymentPoller = startPaymentPoller(pool, paymentPollIntervalMs);
+const stopIdemSweeper = startIdemSweeper(pool, idemSweepIntervalMs);
 
 app.addHook("onClose", async () => {
   stopSweeper();
   stopGatewaySimulator();
   stopPaymentPoller();
+  stopIdemSweeper();
   await pool.end();
 });
 
